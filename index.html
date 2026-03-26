@@ -1,0 +1,1670 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>員工出勤管理系統 v3</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js';
+        import { getFirestore, collection, doc, setDoc, getDocs, updateDoc, deleteDoc, addDoc, onSnapshot, query, where } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
+        import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js';
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDwb-QTbwdVgQ2rLWekv70xY5Nk2YkHiak",
+            authDomain: "lee-erp-c38bf.firebaseapp.com",
+            projectId: "lee-erp-c38bf",
+            storageBucket: "lee-erp-c38bf.firebasestorage.app",
+            messagingSenderId: "1085101558311",
+            appId: "1:1085101558311:web:4207f31dc3b2656d091c02",
+            measurementId: "G-LFSV2SB4B8"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+        const googleProvider = new GoogleAuthProvider();
+
+        window.firebaseDB = db;
+        window.firebaseAuth = auth;
+        window.firebaseModules = {
+            collection, doc, setDoc, getDocs, updateDoc, deleteDoc, addDoc, onSnapshot, query, where
+        };
+        window.googleSignIn = () => signInWithPopup(auth, googleProvider);
+        window.googleSignOut = () => signOut(auth);
+    </script>
+
+    <style>
+        * { -webkit-tap-highlight-color: transparent; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        #loading-screen {
+            position: fixed;
+            inset: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+    <div id="loading-screen">
+        <div class="text-center">
+            <div class="text-white text-3xl font-black mb-4 animate-pulse">載入中...</div>
+            <div class="text-white/80 text-sm">正在連接雲端數據庫</div>
+        </div>
+    </div>
+
+    <div id="app"></div>
+
+    <script>
+        class App {
+            constructor() {
+                this.db = window.firebaseDB;
+                this.auth = window.firebaseAuth;
+                this.modules = window.firebaseModules;
+                
+                this.currentUser = null;
+                this.userPath = null; // e.g. 'companies/uid'
+                this.view = 'attendance';
+                this.selectedDate = new Date().toISOString().split('T')[0];
+                
+                const now = new Date();
+                this.reportStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+                this.reportEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+                this.statsYear = now.getFullYear();
+                this.expandedEmp = null;
+                this.overtimeFilterStart = null;
+                this.overtimeFilterEnd = null;
+
+                this.modals = { employee: false, adjustment: false, overtime: false, attendance: false, locationManagement: false, salaryHistory: false };
+                this.currentEmp = { name: '', dailyRate: 0, status: 'active' };
+                this.currentAdj = { empId: '', empName: '', amount: 0, note: '' };
+                this.currentOvertime = { empId: '', overtimePay: '', loan: '', date: new Date().toISOString().split('T')[0], note: '', isOvertimeChecked: false };
+                this.currentAttendance = { empId: '', empName: '', location: '' };
+                this.currentSalaryHistory = { empId: '', empName: '', history: [] };
+
+                this.employees = [];
+                this.attendance = {};
+                this.adjustments = {};
+                this.overtimes = [];
+                this.salaryHistory = {};
+                this.locations = [];
+
+                this._unsubscribers = [];
+                this.initFirebase();
+            }
+
+            async initFirebase() {
+                this.auth.onAuthStateChanged(async (user) => {
+                    if (user) {
+                        this.currentUser = user;
+                        this.userPath = `companies/${user.uid}`;
+                        console.log('已登入:', user.uid, user.email);
+                        // Unsubscribe previous listeners on re-login
+                        this._unsubscribers.forEach(fn => fn());
+                        this._unsubscribers = [];
+                        await this.setupRealtimeListeners();
+                    } else {
+                        this.currentUser = null;
+                        this.userPath = null;
+                        this.employees = [];
+                        this.attendance = {};
+                        this.adjustments = {};
+                        this.overtimes = [];
+                        this.salaryHistory = {};
+                        this.locations = [];
+                    }
+                    setTimeout(() => {
+                        document.getElementById('loading-screen').style.display = 'none';
+                        this.render();
+                    }, 500);
+                });
+            }
+
+            async signIn() {
+                try {
+                    await window.googleSignIn();
+                } catch (err) {
+                    console.error("登入失敗:", err);
+                    alert('登入失敗，請重試');
+                }
+            }
+
+            async signOut() {
+                if (confirm('確定要登出嗎？')) {
+                    this._unsubscribers.forEach(fn => fn());
+                    this._unsubscribers = [];
+                    await window.googleSignOut();
+                }
+            }
+
+            async setupRealtimeListeners() {
+                const { collection, onSnapshot } = this.modules;
+                const base = this.userPath;
+
+                const unsub1 = onSnapshot(collection(this.db, `${base}/employees`), (snapshot) => {
+                    this.employees = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    this.render();
+                });
+                const unsub2 = onSnapshot(collection(this.db, `${base}/attendance`), (snapshot) => {
+                    this.attendance = {};
+                    snapshot.docs.forEach(doc => { this.attendance[doc.id] = doc.data(); });
+                    this.render();
+                });
+                const unsub3 = onSnapshot(collection(this.db, `${base}/adjustments`), (snapshot) => {
+                    this.adjustments = {};
+                    snapshot.docs.forEach(doc => { this.adjustments[doc.id] = doc.data(); });
+                    this.render();
+                });
+                const unsub4 = onSnapshot(collection(this.db, `${base}/overtimes`), (snapshot) => {
+                    this.overtimes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    this.render();
+                });
+                const unsub5 = onSnapshot(collection(this.db, `${base}/salaryHistory`), (snapshot) => {
+                    this.salaryHistory = {};
+                    snapshot.docs.forEach(doc => { this.salaryHistory[doc.id] = doc.data(); });
+                    this.render();
+                });
+                const unsub6 = onSnapshot(collection(this.db, `${base}/locations`), (snapshot) => {
+                    this.locations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    this.render();
+                });
+                this._unsubscribers.push(unsub1, unsub2, unsub3, unsub4, unsub5, unsub6);
+            }
+
+            getDailyRateAtDate(empId, date) {
+                const history = this.salaryHistory[empId];
+                if (!history) {
+                    const emp = this.employees.find(e => e.id === empId);
+                    return emp ? emp.dailyRate : 0;
+                }
+                
+                let historyArray = [];
+                if (Array.isArray(history)) {
+                    historyArray = history;
+                } else if (typeof history === 'object') {
+                    historyArray = Object.values(history);
+                }
+                
+                if (historyArray.length === 0) {
+                    const emp = this.employees.find(e => e.id === empId);
+                    return emp ? emp.dailyRate : 0;
+                }
+                
+                const sortedHistory = [...historyArray].sort((a, b) => new Date(a.date) - new Date(b.date));
+                let applicableRate = sortedHistory[0].dailyRate;
+                
+                for (const record of sortedHistory) {
+                    if (record.date <= date) {
+                        applicableRate = record.dailyRate;
+                    } else {
+                        break;
+                    }
+                }
+                
+                return applicableRate;
+            }
+
+            render() {
+                const app = document.getElementById('app');
+                if (!app) return;
+
+                if (!this.currentUser) {
+                    app.innerHTML = this.renderLoginScreen();
+                    return;
+                }
+                
+                app.innerHTML = `
+                    <div class="p-2 sm:p-6">
+                        ${this.renderHeader()}
+                        ${this.renderNav()}
+                        <main class="max-w-6xl mx-auto">
+                            ${this.renderContent()}
+                        </main>
+                    </div>
+                    ${this.renderModals()}
+                `;
+                this.attachEventListeners();
+            }
+
+            renderLoginScreen() {
+                return `
+                    <div class="min-h-screen flex items-center justify-center p-4">
+                        <div class="bg-white rounded-3xl p-8 sm:p-12 w-full max-w-md shadow-2xl text-center space-y-8">
+                            <div>
+                                <h1 class="text-3xl font-black bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent mb-2">員工出勤管理系統</h1>
+                                <p class="text-gray-400 text-sm">每間公司獨立帳號 · 數據完全隔離</p>
+                            </div>
+                            <div class="bg-blue-50 p-4 rounded-2xl text-left space-y-2">
+                                <div class="text-xs font-bold text-blue-700 mb-3">🔒 安全架構說明</div>
+                                <div class="text-xs text-blue-600">• 使用 Google 帳號登入，一帳號代表一間公司</div>
+                                <div class="text-xs text-blue-600">• 各公司數據完全隔離，無法互相讀取</div>
+                                <div class="text-xs text-blue-600">• 多裝置登入同一帳號即可共用資料</div>
+                            </div>
+                            <button onclick="app.signIn()" 
+                                class="w-full bg-white border-2 border-gray-200 hover:border-blue-400 hover:bg-blue-50 text-gray-700 py-4 px-6 rounded-2xl font-bold flex items-center justify-center gap-3 transition-all shadow-sm text-base">
+                                <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#4285F4" d="M44.5 20H24v8.5h11.8C34.7 33.9 29.9 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 4.1 29.6 2 24 2 11.8 2 2 11.8 2 24s9.8 22 22 22c11 0 21-8 21-22 0-1.3-.2-2.7-.5-4z"/><path fill="#34A853" d="M6.3 14.7l7 5.1C15 16.1 19.2 13 24 13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 4.1 29.6 2 24 2 16.3 2 9.7 7.4 6.3 14.7z"/><path fill="#FBBC05" d="M24 46c5.8 0 10.7-1.9 14.3-5.2l-6.6-5.6C29.9 37 27.1 38 24 38c-5.8 0-10.7-3.9-11.8-9.2l-7 5.4C8.5 41.8 15.7 46 24 46z"/><path fill="#EA4335" d="M44.5 20H24v8.5h11.8c-1 2.8-2.8 5-5.1 6.5l6.6 5.6C41.3 37.5 44.5 31.2 44.5 24c0-1.3-.2-2.7-.5-4z"/></svg>
+                                使用 Google 帳號登入
+                            </button>
+                            <p class="text-xs text-gray-400">登入即代表您同意本系統之使用條款</p>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderHeader() {
+                return `
+                    <header class="mb-6 sm:mb-8">
+                        <div class="max-w-6xl mx-auto bg-white p-4 sm:p-6 rounded-3xl shadow-lg border-l-8 border-blue-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <div>
+                                    <h1 class="text-2xl sm:text-3xl font-black bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">員工出勤管理系統</h1>
+                                    <p class="text-xs sm:text-sm text-gray-500 mt-1">☁️ 雲端同步 · 多裝置共用</p>
+                                </div>
+                                <div class="flex items-center gap-3">
+                                    <div class="flex items-center gap-2 text-xs sm:text-sm">
+                                        <div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+                                        <span class="font-bold text-gray-600 hidden sm:inline">${this.currentUser?.email || ''}</span>
+                                    </div>
+                                    <button onclick="app.signOut()" class="text-xs text-gray-400 hover:text-red-500 font-bold px-3 py-1 rounded-lg hover:bg-red-50 transition border border-gray-200">
+                                        登出
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+                `;
+            }
+
+            renderNav() {
+                const navItems = [
+                    { id: 'attendance', label: '每日出勤', icon: '📅' },
+                    { id: 'report', label: '薪資結算', icon: '💰' },
+                    { id: 'overtimes', label: '加班&借支', icon: '💳' },
+                    { id: 'stats', label: '年度統計', icon: '📊' },
+                    { id: 'employees', label: '員工管理', icon: '👥' }
+                ];
+
+                return `
+                    <nav class="max-w-6xl mx-auto mb-6 bg-white p-2 rounded-2xl shadow-md flex flex-wrap gap-2">
+                        ${navItems.map(item => `
+                            <button onclick="app.setView('${item.id}')" class="flex-1 min-w-[80px] sm:min-w-0 py-3 px-2 sm:px-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all text-xs sm:text-sm ${
+                                this.view === item.id ? 'bg-blue-600 text-white shadow-lg scale-105' : 'text-gray-600 hover:bg-gray-100'
+                            }">
+                                <span class="text-base">${item.icon}</span>
+                                <span class="hidden sm:inline">${item.label}</span>
+                            </button>
+                        `).join('')}
+                    </nav>
+                `;
+            }
+
+            renderContent() {
+                switch(this.view) {
+                    case 'attendance': return this.renderAttendance();
+                    case 'report': return this.renderReport();
+                    case 'overtimes': return this.renderOvertimes();
+                    case 'stats': return this.renderStats();
+                    case 'employees': return this.renderEmployees();
+                }
+            }
+
+            renderAttendance() {
+                const employees = this.employees.filter(e => e.status === 'active').sort((a, b) => a.name.localeCompare(b.name));
+                
+                return `
+                    <div class="space-y-4">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-blue-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">出勤打卡</h2>
+                                <input type="date" id="selectedDate" value="${this.selectedDate}" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-sm sm:text-base w-full sm:w-auto" />
+                            </div>
+                        </div>
+
+                        <div class="grid gap-3">
+                            ${employees.map(emp => {
+                                const attData = this.attendance[emp.id] || {};
+                                const isPresent = attData.dates?.[this.selectedDate] || false;
+                                const location = attData.locations?.[this.selectedDate] || '';
+                                const currentRate = this.getDailyRateAtDate(emp.id, this.selectedDate);
+                                
+                                return `
+                                    <div class="p-4 sm:p-6 rounded-2xl font-bold transition-all shadow-lg ${
+                                        isPresent ? 'bg-gradient-to-r from-emerald-500 to-green-600 text-white' : 'bg-white text-gray-700'
+                                    }">
+                                        <div class="flex justify-between items-start mb-3">
+                                            <div class="flex items-center gap-3 sm:gap-4">
+                                                <div class="w-12 h-12 sm:w-14 sm:h-14 rounded-xl flex items-center justify-center font-black text-lg sm:text-xl ${isPresent ? 'bg-white/20' : 'bg-blue-50 text-blue-600'}">
+                                                    ${emp.name.charAt(0)}
+                                                </div>
+                                                <div>
+                                                    <div class="text-base sm:text-lg">${emp.name}</div>
+                                                    <div class="text-xs ${isPresent ? 'text-white/80' : 'text-gray-400'}">當日日薪 $${currentRate}</div>
+                                                </div>
+                                            </div>
+                                            <button onclick="app.toggleAttendance('${emp.id}')" class="px-4 py-2 rounded-xl font-bold transition-all ${
+                                                isPresent ? 'bg-white/20 hover:bg-white/30' : 'bg-blue-600 text-white hover:bg-blue-700'
+                                            }">
+                                                ${isPresent ? '✓ 已打卡' : '打卡'}
+                                            </button>
+                                        </div>
+                                        
+                                        ${isPresent ? `
+                                            <div class="flex items-center gap-2">
+                                                <div class="flex-1">
+                                                    <input 
+                                                        type="text" 
+                                                        value="${location}" 
+                                                        onchange="app.updateLocation('${emp.id}', this.value)"
+                                                        placeholder="輸入案場地點..."
+                                                        class="w-full bg-white/20 border-2 border-white/30 text-white placeholder-white/60 p-2 rounded-lg outline-none text-sm"
+                                                    />
+                                                </div>
+                                                <button onclick="app.openLocationModal('${emp.id}', '${emp.name}')" class="px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm">
+                                                    📍 快選
+                                                </button>
+                                            </div>
+                                        ` : ''}
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderReport() {
+                const reportData = this.calculateReport();
+                
+                return `
+                    <div class="space-y-4 sm:space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-emerald-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">薪資結算</h2>
+                                <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                                    <input type="date" id="reportStart" value="${this.reportStart}" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-xs sm:text-sm" />
+                                    <span class="hidden sm:flex items-center text-gray-400 font-bold">至</span>
+                                    <input type="date" id="reportEnd" value="${this.reportEnd}" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-xs sm:text-sm" />
+                                    <button onclick="app.downloadReportExcel()" class="bg-emerald-600 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg text-xs sm:text-sm justify-center">
+                                        <span>📊</span> Excel
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            ${reportData.map(d => `
+                                <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100">
+                                    <div class="flex justify-between items-start mb-4">
+                                        <div class="flex items-center gap-3 sm:gap-4">
+                                            <div class="w-10 h-10 sm:w-12 sm:h-12 bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${d.name.charAt(0)}</div>
+                                            <div>
+                                                <div class="font-bold text-base sm:text-lg">${d.name}</div>
+                                                <div class="text-xs text-gray-400">${d.days} 天 (平均日薪 $${d.avgDailyRate})</div>
+                                            </div>
+                                        </div>
+                                        <button onclick="app.openAdjustment('${d.id}', '${d.name}', ${d.adj})" class="text-emerald-600 p-2 hover:bg-emerald-50 rounded-lg transition-colors" title="薪資調整">
+                                            ⚙️
+                                        </button>
+                                    </div>
+
+                                    <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
+                                        <div class="bg-blue-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">基本薪資</div>
+                                            <div class="text-base sm:text-lg font-black text-blue-600">$${d.baseSalary}</div>
+                                        </div>
+                                        <div class="bg-emerald-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">調整金額</div>
+                                            <div class="text-base sm:text-lg font-black text-emerald-600">${d.adj >= 0 ? '+' : ''}${d.adj}</div>
+                                        </div>
+                                        <div class="bg-purple-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">加班費</div>
+                                            <div class="text-base sm:text-lg font-black text-purple-600">+$${d.totalOvertimePay}</div>
+                                        </div>
+                                        <div class="bg-amber-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">借支扣款</div>
+                                            <div class="text-base sm:text-lg font-black text-amber-600">-$${d.totalLoan}</div>
+                                        </div>
+                                        <div class="bg-gradient-to-br from-indigo-500 to-purple-600 p-3 rounded-xl col-span-2 sm:col-span-1">
+                                            <div class="text-xs text-white/80 font-bold">實發薪資</div>
+                                            <div class="text-base sm:text-lg font-black text-white">$${d.finalSalary}</div>
+                                        </div>
+                                    </div>
+
+                                    ${d.locationStats.length > 0 ? `
+                                        <div class="border-t pt-3 mb-3">
+                                            <div class="text-xs font-bold text-gray-400 mb-2">案場出勤統計：</div>
+                                            <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                                ${d.locationStats.map(loc => `
+                                                    <div class="bg-blue-50 p-2 rounded-lg">
+                                                        <div class="text-xs text-gray-600">${loc.location || '未填寫'}</div>
+                                                        <div class="text-sm font-bold text-blue-600">${loc.days} 天</div>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        </div>
+                                    ` : ''}
+
+                                    ${d.empOvertimes.length > 0 ? `
+                                        <div class="border-t pt-3">
+                                            <div class="text-xs font-bold text-gray-400 mb-2">加班&借支明細：</div>
+                                            <div class="space-y-1">
+                                                ${d.empOvertimes.map(ot => `
+                                                    <div class="text-xs text-gray-600 flex justify-between">
+                                                        <span>${ot.date} - ${ot.note || '無備註'}</span>
+                                                        <span class="font-bold">
+                                                            ${ot.overtimePay > 0 ? `<span class="text-purple-600">加班 $${ot.overtimePay}</span>` : ''}
+                                                            ${ot.overtimePay > 0 && ot.loan > 0 ? ' | ' : ''}
+                                                            ${ot.loan > 0 ? `<span class="text-amber-600">借支 $${ot.loan}</span>` : ''}
+                                                        </span>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderOvertimes() {
+                // 取得當月的開始和結束日期
+                const now = new Date();
+                const defaultStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+                const defaultEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+                
+                // 使用篩選日期或預設當月
+                const filterStart = this.overtimeFilterStart || defaultStart;
+                const filterEnd = this.overtimeFilterEnd || defaultEnd;
+                
+                // 篩選加班借支記錄
+                const filteredOvertimes = this.overtimes
+                    .filter(ot => ot.date >= filterStart && ot.date <= filterEnd)
+                    .sort((a, b) => b.timestamp - a.timestamp);
+                
+                // 計算統計
+                const totalOvertimePay = filteredOvertimes.reduce((s, ot) => s + (ot.overtimePay || 0), 0);
+                const totalLoan = filteredOvertimes.reduce((s, ot) => s + (ot.loan || 0), 0);
+                
+                return `
+                    <div class="space-y-4 sm:space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-amber-600">
+                            <div class="flex flex-col gap-4">
+                                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                    <h2 class="text-lg sm:text-xl font-bold">加班&借支記錄</h2>
+                                    <button onclick="app.openOvertimeModal()" class="bg-amber-500 text-white px-4 py-2 sm:py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg text-sm w-full sm:w-auto justify-center">
+                                        <span>➕</span> 新增記錄
+                                    </button>
+                                </div>
+                                
+                                <div class="flex flex-col sm:flex-row gap-2 items-start sm:items-center">
+                                    <div class="flex gap-2 items-center w-full sm:w-auto">
+                                        <input type="date" id="overtimeFilterStart" value="${filterStart}" 
+                                               class="bg-gray-50 p-2 rounded-lg border-2 border-gray-200 outline-none text-xs flex-1 sm:flex-none" />
+                                        <span class="text-gray-400">至</span>
+                                        <input type="date" id="overtimeFilterEnd" value="${filterEnd}" 
+                                               class="bg-gray-50 p-2 rounded-lg border-2 border-gray-200 outline-none text-xs flex-1 sm:flex-none" />
+                                        <button onclick="app.filterOvertimes()" 
+                                                class="bg-blue-500 text-white px-3 py-2 rounded-lg text-xs font-bold">
+                                            篩選
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                <div class="grid grid-cols-3 gap-3">
+                                    <div class="bg-purple-50 p-3 rounded-xl">
+                                        <div class="text-xs text-gray-500 font-bold">總加班費</div>
+                                        <div class="text-lg font-black text-purple-600">$${totalOvertimePay}</div>
+                                    </div>
+                                    <div class="bg-amber-50 p-3 rounded-xl">
+                                        <div class="text-xs text-gray-500 font-bold">總借支</div>
+                                        <div class="text-lg font-black text-amber-600">$${totalLoan}</div>
+                                    </div>
+                                    <div class="bg-gray-50 p-3 rounded-xl">
+                                        <div class="text-xs text-gray-500 font-bold">記錄數</div>
+                                        <div class="text-lg font-black text-gray-600">${filteredOvertimes.length}</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            ${filteredOvertimes.length > 0 ? filteredOvertimes.map(ot => `
+                                <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                    <div class="flex items-center gap-3 sm:gap-4 w-full sm:w-auto">
+                                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-amber-50 text-amber-600 rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${ot.empName.charAt(0)}</div>
+                                        <div class="flex-1">
+                                            <div class="font-bold text-base sm:text-lg">${ot.empName}</div>
+                                            <div class="text-xs text-gray-400">${ot.date} - ${ot.note || '無備註'}</div>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-3 sm:gap-4 w-full sm:w-auto justify-between sm:justify-end">
+                                        <div class="flex gap-2">
+                                            ${ot.overtimePay > 0 ? `<div class="text-sm font-black text-purple-600">加班 $${ot.overtimePay}</div>` : ''}
+                                            ${ot.loan > 0 ? `<div class="text-sm font-black text-amber-600">借支 $${ot.loan}</div>` : ''}
+                                        </div>
+                                        <button onclick="app.deleteOvertime('${ot.id}')" class="text-red-400 hover:text-red-600 transition-colors p-2">🗑️</button>
+                                    </div>
+                                </div>
+                            `).join('') : `
+                                <div class="bg-white p-8 rounded-2xl shadow-sm text-center text-gray-400">
+                                    <p class="text-lg font-bold mb-2">此期間無記錄</p>
+                                    <p class="text-sm">請選擇其他日期範圍或新增記錄</p>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderStats() {
+                const statsData = this.calculateStats();
+                
+                return `
+                    <div class="space-y-4 sm:space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-indigo-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">年度統計</h2>
+                                <div class="flex gap-2 w-full sm:w-auto">
+                                    <select id="statsYear" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-sm sm:text-base flex-1 sm:flex-none">
+                                        ${Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i).map(y => `
+                                            <option value="${y}" ${y === this.statsYear ? 'selected' : ''}>${y} 年</option>
+                                        `).join('')}
+                                    </select>
+                                    <button onclick="app.downloadStatsExcel()" class="bg-emerald-600 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg text-xs sm:text-sm justify-center">
+                                        <span>📊</span> Excel
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-4">
+                            ${statsData.map(emp => `
+                                <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                                    <div onclick="app.toggleExpand('${emp.id}')" class="p-4 sm:p-6 flex justify-between items-center cursor-pointer hover:bg-gray-50 transition">
+                                        <div class="flex items-center gap-3 sm:gap-4">
+                                            <div class="w-10 h-10 sm:w-12 sm:h-12 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${emp.name.charAt(0)}</div>
+                                            <div>
+                                                <div class="font-bold text-base sm:text-lg">${emp.name}</div>
+                                                <div class="text-xs text-gray-400">全年共 ${emp.totalDays} 天</div>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center gap-3">
+                                            <div class="text-xl sm:text-2xl font-black text-indigo-600">${emp.totalDays} 天</div>
+                                            <span>${this.expandedEmp === emp.id ? '▲' : '▼'}</span>
+                                        </div>
+                                    </div>
+                                    ${this.expandedEmp === emp.id ? `
+                                        <div class="p-4 bg-gray-50 border-t">
+                                            <div class="grid grid-cols-3 sm:grid-cols-6 gap-2 mb-4">
+                                                ${emp.monthlyData.map(m => `
+                                                    <div class="p-2 bg-white rounded-lg border text-center">
+                                                        <div class="text-[10px] text-gray-400 font-bold">${m.month}月</div>
+                                                        <div class="text-sm font-bold">${m.days}天</div>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                            
+                                            ${emp.locationStats.length > 0 ? `
+                                                <div class="mt-4 pt-4 border-t">
+                                                    <div class="text-xs font-bold text-gray-400 mb-2">全年案場統計：</div>
+                                                    <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                                        ${emp.locationStats.map(loc => `
+                                                            <div class="bg-blue-50 p-2 rounded-lg">
+                                                                <div class="text-xs text-gray-600">${loc.location || '未填寫'}</div>
+                                                                <div class="text-sm font-bold text-blue-600">${loc.days} 天</div>
+                                                            </div>
+                                                        `).join('')}
+                                                    </div>
+                                                </div>
+                                            ` : ''}
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderEmployees() {
+                const activeEmployees = this.employees.filter(e => e.status === 'active').sort((a, b) => a.name.localeCompare(b.name));
+                const inactiveEmployees = this.employees.filter(e => e.status === 'inactive').sort((a, b) => a.name.localeCompare(b.name));
+                
+                return `
+                    <div class="space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-gray-800 space-y-4">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">員工清單</h2>
+                                <div class="flex flex-wrap gap-2 w-full sm:w-auto">
+                                    <button onclick="app.downloadTemplate()" class="text-blue-500 p-2 hover:bg-blue-50 rounded-lg flex items-center gap-1 text-xs font-bold border border-blue-200">
+                                        📥 下載範例
+                                    </button>
+                                    <button onclick="app.exportEmployees()" class="text-purple-500 p-2 hover:bg-purple-50 rounded-lg flex items-center gap-1 text-xs font-bold border border-purple-200">
+                                        📊 匯出清單
+                                    </button>
+                                    <button onclick="document.getElementById('csvImport').click()" class="text-emerald-500 p-2 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-xs font-bold border border-emerald-200">
+                                        📤 批次匯入
+                                    </button>
+                                    <input type="file" id="csvImport" accept=".csv,.xlsx,.xls" style="display:none" />
+                                    <button onclick="app.openLocationManagement()" class="text-gray-600 p-2 hover:bg-gray-100 rounded-lg flex items-center gap-1 text-xs font-bold border border-gray-200">
+                                        ⚙️ 案場管理
+                                    </button>
+                                    <button onclick="app.openEmployeeModal()" class="bg-black text-white px-3 sm:px-4 py-2 rounded-xl font-bold flex items-center gap-2 shadow-lg text-sm flex-1 sm:flex-none justify-center">
+                                        ➕ 新增人員
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-2">
+                            <div class="text-xs font-black text-blue-500 px-4 uppercase tracking-widest flex items-center gap-2">
+                                <div class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+                                在職中 (${activeEmployees.length})
+                            </div>
+                            ${activeEmployees.map(emp => `
+                                <div class="bg-white p-4 rounded-2xl flex justify-between items-center shadow-sm border border-transparent hover:border-blue-200 transition group">
+                                    <div class="flex items-center gap-3 sm:gap-4">
+                                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center font-black group-hover:scale-110 transition text-base sm:text-lg">${emp.name.charAt(0)}</div>
+                                        <div>
+                                            <div class="font-bold text-base sm:text-lg">${emp.name}</div>
+                                            <div class="text-xs text-gray-400 font-bold flex items-center gap-2">
+                                                目前日薪 $${emp.dailyRate}
+                                                <button onclick="app.viewSalaryHistory('${emp.id}', '${emp.name}')" class="text-blue-500 hover:underline">📊 歷史</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-2 sm:gap-3">
+                                        <button onclick="app.toggleStatus('${emp.id}')" class="p-2 text-gray-300 hover:text-orange-500 transition-colors" title="標記為離職">👤</button>
+                                        <button onclick="app.deleteEmployee('${emp.id}', '${emp.name}')" class="p-2 text-gray-300 hover:text-red-500 transition-colors" title="徹底刪除">🗑️</button>
+                                        <button onclick="app.editEmployee('${emp.id}')" class="p-2 text-gray-300 hover:text-blue-500 transition-colors" title="修改">✏️</button>
+                                    </div>
+                                </div>
+                            `).join('')}
+
+                            <div class="text-xs font-black text-gray-400 px-4 mt-8 uppercase tracking-widest flex items-center gap-2">
+                                <div class="w-2 h-2 rounded-full bg-gray-300"></div>
+                                已離職 (${inactiveEmployees.length})
+                            </div>
+                            ${inactiveEmployees.map(emp => `
+                                <div class="bg-gray-100/50 p-4 rounded-2xl flex justify-between items-center opacity-60 hover:opacity-100 transition group">
+                                    <div class="flex items-center gap-3 sm:gap-4 grayscale">
+                                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-gray-200 text-gray-500 rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${emp.name.charAt(0)}</div>
+                                        <div>
+                                            <div class="text-gray-500 font-bold text-base sm:text-lg">${emp.name}</div>
+                                            <div class="text-[10px] px-1 bg-gray-200 text-gray-400 rounded inline-block font-bold">已離職</div>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-2 sm:gap-3">
+                                        <button onclick="app.toggleStatus('${emp.id}')" class="p-2 text-gray-400 hover:text-emerald-500 transition-colors" title="恢復在職">✓</button>
+                                        <button onclick="app.deleteEmployee('${emp.id}', '${emp.name}')" class="p-2 text-gray-400 hover:text-red-500 transition-colors" title="徹底刪除">🗑️</button>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderModals() {
+                let html = '';
+                if (this.modals.employee) html += this.renderEmployeeModal();
+                if (this.modals.adjustment) html += this.renderAdjustmentModal();
+                if (this.modals.overtime) html += this.renderOvertimeModal();
+                if (this.modals.attendance) html += this.renderLocationModal();
+                if (this.modals.locationManagement) html += this.renderLocationManagementModal();
+                if (this.modals.salaryHistory) html += this.renderSalaryHistoryModal();
+                return html;
+            }
+
+            renderEmployeeModal() {
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center">${this.currentEmp.id ? '修改員工資訊' : '新增員工'}</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="text-xs text-gray-500 font-bold block mb-2">員工姓名</label>
+                                    <input type="text" id="empName" value="${this.currentEmp.name}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none border-2 border-gray-100 text-sm sm:text-base" placeholder="員工姓名" />
+                                </div>
+                                <div>
+                                    <label class="text-xs text-gray-500 font-bold block mb-2">日薪</label>
+                                    <input type="number" id="empRate" value="${this.currentEmp.dailyRate}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none border-2 border-gray-100 text-sm sm:text-base" placeholder="1000" />
+                                </div>
+                                ${this.currentEmp.id ? `
+                                    <div>
+                                        <label class="text-xs text-gray-500 font-bold block mb-2">調整原因（選填）</label>
+                                        <input type="text" id="empRateNote" value="" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none border-2 border-gray-100 text-sm sm:text-base" placeholder="例如：年度調薪、表現優良" />
+                                    </div>
+                                    <div class="bg-blue-50 p-3 rounded-xl text-xs text-blue-600">
+                                        💡 修改日薪會自動記錄到歷史，不影響之前的報表計算
+                                    </div>
+                                ` : ''}
+                                ${this.currentEmp.id ? `
+                                    <div class="flex items-center justify-between p-3 sm:p-4 bg-gray-50 rounded-2xl border-2 border-gray-100">
+                                        <span class="text-sm font-bold text-gray-600">在職狀態</span>
+                                        <button onclick="app.toggleCurrentEmpStatus()" class="px-3 sm:px-4 py-2 rounded-xl font-bold text-white transition-all text-sm ${this.currentEmp.status === 'active' ? 'bg-emerald-500 hover:bg-emerald-600' : 'bg-gray-400 hover:bg-gray-500'}">
+                                            ${this.currentEmp.status === 'active' ? '在職中' : '已離職'}
+                                        </button>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <div class="flex gap-3">
+                                <button onclick="app.closeModal('employee')" class="flex-1 py-3 sm:py-4 font-bold text-gray-400 text-sm sm:text-base">取消</button>
+                                <button onclick="app.saveEmployee()" class="flex-1 bg-blue-600 text-white py-3 sm:py-4 rounded-2xl font-bold shadow-lg text-sm sm:text-base">儲存</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderAdjustmentModal() {
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-4">
+                            <h3 class="text-lg sm:text-xl font-bold text-center">調整 ${this.currentAdj.empName} 薪資</h3>
+                            <p class="text-xs text-gray-400 text-center">此調整僅針對目前的結算週期</p>
+                            <input type="number" id="adjAmount" value="${this.currentAdj.amount}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="調整金額 (可為負數)" />
+                            <input type="text" id="adjNote" value="${this.currentAdj.note}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="調整原因" />
+                            <div class="flex gap-3 pt-4">
+                                <button onclick="app.closeModal('adjustment')" class="flex-1 font-bold text-gray-400 text-sm sm:text-base">取消</button>
+                                <button onclick="app.saveAdjustment()" class="flex-1 bg-emerald-600 text-white py-3 sm:py-4 rounded-2xl font-bold text-sm sm:text-base">確認調整</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderOvertimeModal() {
+                const activeEmployees = this.employees.filter(e => e.status === 'active');
+                const isChecked = this.currentOvertime.isOvertimeChecked;
+                const selectedEmpId = this.currentOvertime.empId;
+                const overtimeDate = this.currentOvertime.date;
+                
+                // Calculate auto overtime pay if checkbox checked and employee selected
+                let autoOvertimePay = 0;
+                if (isChecked && selectedEmpId) {
+                    const dailyRate = this.getDailyRateAtDate(selectedEmpId, overtimeDate);
+                    autoOvertimePay = Math.round(dailyRate * 0.5);
+                }
+                
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center text-amber-600">新增加班&借支</h3>
+                            <div class="space-y-4">
+                                <select id="overtimeEmpId" onchange="app.onOvertimeEmpChange()" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base">
+                                    <option value="">選擇員工...</option>
+                                    ${activeEmployees.map(e => `
+                                        <option value="${e.id}" ${e.id === selectedEmpId ? 'selected' : ''}>${e.name}</option>
+                                    `).join('')}
+                                </select>
+                                <input type="date" id="overtimeDate" value="${overtimeDate}" onchange="app.onOvertimeDateChange()" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" />
+                                
+                                <!-- Overtime checkbox -->
+                                <div class="bg-purple-50 border-2 border-purple-100 p-4 rounded-2xl space-y-3">
+                                    <label class="flex items-center gap-3 cursor-pointer">
+                                        <input type="checkbox" id="overtimeCheckbox" ${isChecked ? 'checked' : ''} 
+                                               onchange="app.onOvertimeCheckboxChange()"
+                                               class="w-5 h-5 rounded accent-purple-600 cursor-pointer" />
+                                        <span class="font-bold text-purple-700 text-sm">加班（自動計算日薪 × 50%）</span>
+                                    </label>
+                                    ${isChecked ? `
+                                        <div class="bg-white rounded-xl p-3 text-center">
+                                            <div class="text-xs text-gray-400 font-bold mb-1">自動計算加班費</div>
+                                            <div class="text-2xl font-black text-purple-600">$${autoOvertimePay}</div>
+                                            ${selectedEmpId ? `<div class="text-xs text-gray-400 mt-1">（日薪 $${this.getDailyRateAtDate(selectedEmpId, overtimeDate)} × 50%）</div>` : '<div class="text-xs text-gray-400 mt-1">請先選擇員工</div>'}
+                                        </div>
+                                    ` : ''}
+                                </div>
+
+                                <input type="number" id="loanAmount" value="" class="w-full bg-amber-50 border-2 border-amber-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="借支金額（選填）" />
+                                <input type="text" id="overtimeNote" value="" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="備註" />
+                            </div>
+                            <div class="flex gap-3">
+                                <button onclick="app.closeModal('overtime')" class="flex-1 py-3 sm:py-4 font-bold text-gray-400 text-sm sm:text-base">取消</button>
+                                <button onclick="app.saveOvertime()" class="flex-1 bg-amber-500 text-white py-3 sm:py-4 rounded-2xl font-bold shadow-lg text-sm sm:text-base">確認</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderLocationModal() {
+                // 取得所有使用過的案場地點
+                const allLocations = new Set();
+                Object.values(this.attendance).forEach(attData => {
+                    if (attData.locations) {
+                        Object.values(attData.locations).forEach(loc => {
+                            if (loc && loc.trim()) allLocations.add(loc.trim());
+                        });
+                    }
+                });
+                const locations = Array.from(allLocations).sort();
+
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center">選擇案場地點</h3>
+                            <p class="text-xs text-gray-400 text-center">${this.currentAttendance.empName}</p>
+                            <div class="space-y-2 max-h-96 overflow-y-auto">
+                                <input 
+                                    type="text" 
+                                    id="newLocation" 
+                                    class="w-full bg-blue-50 border-2 border-blue-200 p-3 rounded-xl font-bold outline-none text-sm" 
+                                    placeholder="輸入新的案場地點..." 
+                                />
+                                <button onclick="app.selectNewLocation()" class="w-full bg-blue-600 text-white p-3 rounded-xl font-bold">
+                                    ➕ 使用新地點
+                                </button>
+                                
+                                ${locations.length > 0 ? `
+                                    <div class="border-t pt-4 mt-4">
+                                        <div class="text-xs font-bold text-gray-400 mb-2">常用案場：</div>
+                                        ${locations.map(loc => `
+                                            <button onclick="app.selectLocation('${loc}')" class="w-full text-left bg-gray-50 hover:bg-gray-100 p-3 rounded-xl font-bold text-sm mb-2 transition">
+                                                📍 ${loc}
+                                            </button>
+                                        `).join('')}
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <button onclick="app.closeModal('attendance')" class="w-full py-3 font-bold text-gray-400">取消</button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            attachEventListeners() {
+                const sd = document.getElementById('selectedDate');
+                if (sd) sd.onchange = (e) => { this.selectedDate = e.target.value; this.render(); };
+                
+                const rs = document.getElementById('reportStart');
+                if (rs) rs.onchange = (e) => { this.reportStart = e.target.value; this.render(); };
+                
+                const re = document.getElementById('reportEnd');
+                if (re) re.onchange = (e) => { this.reportEnd = e.target.value; this.render(); };
+                
+                const sy = document.getElementById('statsYear');
+                if (sy) sy.onchange = (e) => { this.statsYear = Number(e.target.value); this.render(); };
+                
+                const csvImport = document.getElementById('csvImport');
+                if (csvImport) csvImport.onchange = (e) => this.handleImport(e);
+            }
+
+            setView(view) { this.view = view; this.render(); }
+            toggleExpand(empId) { this.expandedEmp = this.expandedEmp === empId ? null : empId; this.render(); }
+            closeModal(type) { this.modals[type] = false; this.render(); }
+
+            async toggleAttendance(empId) {
+                const { doc, setDoc } = this.modules;
+                const attData = this.attendance[empId] || { dates: {}, locations: {} };
+                const isPresent = attData.dates?.[this.selectedDate] || false;
+                
+                attData.dates = attData.dates || {};
+                attData.dates[this.selectedDate] = !isPresent;
+                
+                await setDoc(doc(this.db, `${this.userPath}/attendance`, empId), attData, { merge: true });
+            }
+
+            async updateLocation(empId, location) {
+                const { doc, setDoc, collection, addDoc, updateDoc } = this.modules;
+                const attData = this.attendance[empId] || { dates: {}, locations: {} };
+                
+                attData.locations = attData.locations || {};
+                attData.locations[this.selectedDate] = location;
+                
+                await setDoc(doc(this.db, `${this.userPath}/attendance`, empId), attData, { merge: true });
+                
+                if (location && location.trim()) {
+                    const loc = this.locations.find(l => l.name === location.trim());
+                    if (loc) {
+                        await updateDoc(doc(this.db, `${this.userPath}/locations`, loc.id), { 
+                            count: loc.count + 1 
+                        });
+                    } else {
+                        await addDoc(collection(this.db, `${this.userPath}/locations`), { 
+                            name: location.trim(), 
+                            count: 1, 
+                            createdAt: Date.now() 
+                        });
+                    }
+                }
+            }
+
+            openLocationModal(empId, empName) {
+                this.currentAttendance = { empId, empName };
+                this.modals.attendance = true;
+                this.render();
+            }
+
+            selectLocation(location) {
+                this.updateLocation(this.currentAttendance.empId, location);
+                this.closeModal('attendance');
+            }
+
+            selectNewLocation() {
+                const location = document.getElementById('newLocation').value.trim();
+                if (location) {
+                    this.updateLocation(this.currentAttendance.empId, location);
+                    this.closeModal('attendance');
+                }
+            }
+
+            openEmployeeModal() { 
+                this.currentEmp = { name: '', dailyRate: 0, status: 'active' }; 
+                this.modals.employee = true; 
+                this.render(); 
+            }
+            
+            editEmployee(id) { 
+                const emp = this.employees.find(e => e.id === id); 
+                if (emp) { 
+                    this.currentEmp = { ...emp }; 
+                    this.modals.employee = true; 
+                    this.render(); 
+                } 
+            }
+            
+            async saveEmployee() {
+                const name = document.getElementById('empName').value.trim();
+                const newRate = Number(document.getElementById('empRate').value);
+                const rateNote = document.getElementById('empRateNote')?.value.trim() || '';
+                
+                if (!name || !newRate) return alert('請填寫完整資料');
+                
+                const { collection, doc, addDoc, updateDoc, setDoc } = this.modules;
+                
+                if (this.currentEmp.id) {
+                    const emp = this.employees.find(e => e.id === this.currentEmp.id);
+                    
+                    if (emp && emp.dailyRate !== newRate) {
+                        const historyRef = doc(this.db, `${this.userPath}/salaryHistory`, this.currentEmp.id);
+                        const currentHistory = this.salaryHistory[this.currentEmp.id] || [];
+                        
+                        const updatedHistory = Array.isArray(currentHistory) ? 
+                            [...currentHistory] : 
+                            (currentHistory ? Object.values(currentHistory) : []);
+                        
+                        updatedHistory.push({
+                            date: new Date().toISOString().split('T')[0],
+                            dailyRate: newRate,
+                            note: rateNote || '日薪調整',
+                            timestamp: Date.now()
+                        });
+                        
+                        await setDoc(historyRef, updatedHistory);
+                    }
+                    
+                    await updateDoc(doc(this.db, `${this.userPath}/employees`, this.currentEmp.id), { 
+                        name, 
+                        dailyRate: newRate,
+                        status: this.currentEmp.status
+                    });
+                } else {
+                    const empRef = await addDoc(collection(this.db, `${this.userPath}/employees`), { 
+                        name, 
+                        dailyRate: newRate, 
+                        status: 'active', 
+                        createdAt: Date.now() 
+                    });
+                    
+                    await setDoc(doc(this.db, `${this.userPath}/salaryHistory`, empRef.id), [{
+                        date: new Date().toISOString().split('T')[0],
+                        dailyRate: newRate,
+                        note: '初始日薪',
+                        timestamp: Date.now()
+                    }]);
+                }
+                
+                this.closeModal('employee');
+            }
+
+            toggleCurrentEmpStatus() {
+                this.currentEmp.status = this.currentEmp.status === 'active' ? 'inactive' : 'active';
+                this.render();
+            }
+
+            async toggleStatus(id) {
+                const emp = this.employees.find(e => e.id === id);
+                if (!emp) return;
+
+                const newStatus = emp.status === 'active' ? 'inactive' : 'active';
+                const confirmMsg = newStatus === 'inactive' ? 
+                    `確定要將「${emp.name}」標記為離職嗎？` : 
+                    `確定要將「${emp.name}」恢復為在職嗎？`;
+                
+                if (confirm(confirmMsg)) {
+                    const { doc, updateDoc } = this.modules;
+                    await updateDoc(doc(this.db, `${this.userPath}/employees`, id), { status: newStatus });
+                }
+            }
+
+            async deleteEmployee(id, name) {
+                if (confirm(`⚠️ 嚴重警告！\n\n您確定要「徹底刪除」員工：${name} 嗎？\n\n這將移除該員工的所有個人基本資料，且無法復原。\n建議若只是該員工目前沒上班，使用「離職」功能即可。`)) {
+                    const { doc, deleteDoc, collection, query, where, getDocs } = this.modules;
+                    
+                    await deleteDoc(doc(this.db, `${this.userPath}/employees`, id));
+                    
+                    const overtimesQuery = query(collection(this.db, `${this.userPath}/overtimes`), where('empId', '==', id));
+                    const overtimesSnapshot = await getDocs(overtimesQuery);
+                    overtimesSnapshot.forEach(async (otDoc) => {
+                        await deleteDoc(otDoc.ref);
+                    });
+                }
+            }
+
+            openAdjustment(empId, empName, amount) { 
+                this.currentAdj = { empId, empName, amount, note: '' }; 
+                this.modals.adjustment = true; 
+                this.render(); 
+            }
+            
+            async saveAdjustment() {
+                const amount = document.getElementById('adjAmount').value;
+                const note = document.getElementById('adjNote').value;
+                const key = `${this.reportStart}_${this.reportEnd}_${this.currentAdj.empId}`;
+                
+                const { doc, setDoc } = this.modules;
+                await setDoc(doc(this.db, `${this.userPath}/adjustments`, key), {
+                    empId: this.currentAdj.empId, 
+                    empName: this.currentAdj.empName,
+                    amount: Number(amount), 
+                    note, 
+                    start: this.reportStart, 
+                    end: this.reportEnd
+                });
+                this.closeModal('adjustment');
+            }
+
+            openOvertimeModal() { 
+                this.currentOvertime = { empId: '', overtimePay: '', loan: '', date: new Date().toISOString().split('T')[0], note: '', isOvertimeChecked: false };
+                this.modals.overtime = true; 
+                this.render(); 
+            }
+
+            onOvertimeEmpChange() {
+                const empId = document.getElementById('overtimeEmpId')?.value || '';
+                this.currentOvertime.empId = empId;
+                if (this.currentOvertime.isOvertimeChecked) this.render();
+            }
+
+            onOvertimeDateChange() {
+                const date = document.getElementById('overtimeDate')?.value || '';
+                this.currentOvertime.date = date;
+                if (this.currentOvertime.isOvertimeChecked) this.render();
+            }
+
+            onOvertimeCheckboxChange() {
+                const checked = document.getElementById('overtimeCheckbox')?.checked || false;
+                const empId = document.getElementById('overtimeEmpId')?.value || '';
+                const date = document.getElementById('overtimeDate')?.value || this.currentOvertime.date;
+                this.currentOvertime.isOvertimeChecked = checked;
+                this.currentOvertime.empId = empId;
+                this.currentOvertime.date = date;
+                this.render();
+            }
+            
+            async saveOvertime() {
+                const empId = document.getElementById('overtimeEmpId').value;
+                const isOvertimeChecked = document.getElementById('overtimeCheckbox')?.checked || false;
+                const date = document.getElementById('overtimeDate').value;
+                const loan = Number(document.getElementById('loanAmount').value) || 0;
+                const note = document.getElementById('overtimeNote').value;
+                
+                let overtimePay = 0;
+                if (isOvertimeChecked) {
+                    const dailyRate = this.getDailyRateAtDate(empId, date);
+                    overtimePay = Math.round(dailyRate * 0.5);
+                }
+                
+                if (!empId) return alert('請選擇員工');
+                if (overtimePay === 0 && loan === 0) return alert('請勾選加班或填寫借支金額');
+                
+                const emp = this.employees.find(e => e.id === empId);
+                const { collection, addDoc } = this.modules;
+                
+                await addDoc(collection(this.db, `${this.userPath}/overtimes`), {
+                    empId, 
+                    empName: emp.name, 
+                    overtimePay,
+                    loan,
+                    date,
+                    note,
+                    timestamp: Date.now()
+                });
+                this.closeModal('overtime');
+            }
+
+            async deleteOvertime(id) { 
+                if (confirm('確定要刪除此記錄？')) {
+                    const { doc, deleteDoc } = this.modules;
+                    await deleteDoc(doc(this.db, `${this.userPath}/overtimes`, id)); 
+                }
+            }
+
+            calculateReport() {
+                const start = new Date(this.reportStart);
+                const end = new Date(this.reportEnd);
+                const dates = [];
+                
+                for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                    dates.push(new Date(d).toISOString().split('T')[0]);
+                }
+
+                return this.employees.filter(e => e.status === 'active').map(emp => {
+                    const attData = this.attendance[emp.id] || { dates: {}, locations: {} };
+                    const workDates = dates.filter(d => attData.dates?.[d]);
+                    const days = workDates.length;
+                    
+                    let baseSalary = 0;
+                    let totalRate = 0;
+                    workDates.forEach(date => {
+                        const rate = this.getDailyRateAtDate(emp.id, date);
+                        baseSalary += rate;
+                        totalRate += rate;
+                    });
+                    const avgDailyRate = days > 0 ? Math.round(totalRate / days) : emp.dailyRate;
+                    
+                    const adj = this.adjustments[`${this.reportStart}_${this.reportEnd}_${emp.id}`]?.amount || 0;
+                    
+                    const empOvertimes = this.overtimes.filter(ot => ot.empId === emp.id && ot.date >= this.reportStart && ot.date <= this.reportEnd);
+                    const totalOvertimePay = empOvertimes.reduce((s, ot) => s + (ot.overtimePay || 0), 0);
+                    const totalLoan = empOvertimes.reduce((s, ot) => s + (ot.loan || 0), 0);
+                    
+                    const locationMap = {};
+                    dates.forEach(d => {
+                        if (attData.dates?.[d]) {
+                            const loc = attData.locations?.[d] || '未填寫';
+                            locationMap[loc] = (locationMap[loc] || 0) + 1;
+                        }
+                    });
+                    const locationStats = Object.entries(locationMap).map(([location, days]) => ({ location, days })).sort((a, b) => b.days - a.days);
+                    
+                    return { 
+                        id: emp.id, 
+                        name: emp.name, 
+                        dailyRate: emp.dailyRate,
+                        avgDailyRate,
+                        days, 
+                        baseSalary, 
+                        adj,
+                        totalOvertimePay,
+                        totalLoan,
+                        finalSalary: baseSalary + adj + totalOvertimePay - totalLoan,
+                        empOvertimes,
+                        locationStats
+                    };
+                });
+            }
+
+            calculateStats() {
+                const yearStart = `${this.statsYear}-01-01`;
+                const yearEnd = `${this.statsYear}-12-31`;
+                const days = [];
+                
+                for (let d = new Date(yearStart); d <= new Date(yearEnd); d.setDate(d.getDate() + 1)) {
+                    days.push(new Date(d).toISOString().split('T')[0]);
+                }
+
+                return this.employees.filter(e => e.status === 'active').map(emp => {
+                    const attData = this.attendance[emp.id] || { dates: {}, locations: {} };
+                    
+                    const monthlyData = Array.from({ length: 12 }, (_, i) => {
+                        const month = i + 1;
+                        const monthDays = days.filter(d => {
+                            const [y, m] = d.split('-');
+                            return Number(y) === this.statsYear && Number(m) === month;
+                        });
+                        const workedDays = monthDays.filter(d => attData.dates?.[d]).length;
+                        return { month, days: workedDays };
+                    });
+
+                    // 計算全年案場統計
+                    const locationMap = {};
+                    days.forEach(d => {
+                        if (attData.dates?.[d]) {
+                            const loc = attData.locations?.[d] || '未填寫';
+                            locationMap[loc] = (locationMap[loc] || 0) + 1;
+                        }
+                    });
+                    const locationStats = Object.entries(locationMap).map(([location, days]) => ({ location, days })).sort((a, b) => b.days - a.days);
+
+                    const totalDays = monthlyData.reduce((sum, m) => sum + m.days, 0);
+                    return { id: emp.id, name: emp.name, monthlyData, totalDays, locationStats };
+                });
+            }
+
+            downloadReportExcel() {
+                const data = this.calculateReport();
+                const wb = XLSX.utils.book_new();
+                
+                // 工作表1：薪資報表
+                const wsData1 = [
+                    ['薪資報表'],
+                    [`結算期間: ${this.reportStart} 至 ${this.reportEnd}`],
+                    [],
+                    ['員工姓名', '平均日薪', '出勤天數', '基本薪資', '調整金額', '加班費', '借支扣款', '實發薪資']
+                ];
+                
+                data.forEach(d => {
+                    wsData1.push([d.name, d.avgDailyRate, d.days, d.baseSalary, d.adj, d.totalOvertimePay, d.totalLoan, d.finalSalary]);
+                });
+
+                const ws1 = XLSX.utils.aoa_to_sheet(wsData1);
+                ws1['!cols'] = [
+                    { wch: 12 }, { wch: 10 }, { wch: 12 }, 
+                    { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }
+                ];
+                XLSX.utils.book_append_sheet(wb, ws1, '薪資報表');
+
+                // 工作表2：日薪明細（每天實際使用的日薪）
+                const start = new Date(this.reportStart);
+                const end = new Date(this.reportEnd);
+                const allDates = [];
+                for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                    allDates.push(new Date(d).toISOString().split('T')[0]);
+                }
+
+                const wsData2 = [
+                    ['日薪明細（每日實際日薪）'],
+                    [`結算期間: ${this.reportStart} 至 ${this.reportEnd}`],
+                    [`※ 依調薪歷史動態抓取，反映該日當時的實際日薪`],
+                    [],
+                    ['員工姓名', '日期', '是否出勤', '當日日薪', '案場']
+                ];
+
+                data.forEach(d => {
+                    const attData = this.attendance[d.id] || { dates: {}, locations: {} };
+                    allDates.forEach(date => {
+                        const worked = attData.dates?.[date] || false;
+                        if (worked) {
+                            const rate = this.getDailyRateAtDate(d.id, date);
+                            const location = attData.locations?.[date] || '';
+                            wsData2.push([d.name, date, '✓ 出勤', rate, location]);
+                        }
+                    });
+                });
+
+                const ws2 = XLSX.utils.aoa_to_sheet(wsData2);
+                ws2['!cols'] = [{ wch: 12 }, { wch: 14 }, { wch: 10 }, { wch: 12 }, { wch: 20 }];
+                XLSX.utils.book_append_sheet(wb, ws2, '日薪明細');
+                
+                // 工作表3：案場統計
+                const wsData3 = [
+                    ['案場出勤統計'],
+                    [`統計期間: ${this.reportStart} 至 ${this.reportEnd}`],
+                    [],
+                    ['員工姓名', '案場地點', '天數']
+                ];
+                
+                data.forEach(d => {
+                    d.locationStats.forEach(loc => {
+                        wsData3.push([d.name, loc.location, loc.days]);
+                    });
+                });
+
+                const ws3 = XLSX.utils.aoa_to_sheet(wsData3);
+                ws3['!cols'] = [{ wch: 12 }, { wch: 20 }, { wch: 10 }];
+                XLSX.utils.book_append_sheet(wb, ws3, '案場統計');
+                
+                XLSX.writeFile(wb, `薪資報表_${this.reportStart}_${this.reportEnd}.xlsx`);
+            }
+
+            downloadStatsExcel() {
+                const data = this.calculateStats();
+                const wb = XLSX.utils.book_new();
+                
+                // 工作表1：月度統計
+                const wsData1 = [
+                    [`${this.statsYear}年度出勤統計`],
+                    [],
+                    ['員工姓名', '1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月', '全年總計']
+                ];
+                
+                data.forEach(emp => {
+                    const row = [emp.name];
+                    emp.monthlyData.forEach(m => row.push(m.days));
+                    row.push(emp.totalDays);
+                    wsData1.push(row);
+                });
+
+                const ws1 = XLSX.utils.aoa_to_sheet(wsData1);
+                ws1['!cols'] = [{ wch: 12 }, ...Array(12).fill({ wch: 6 }), { wch: 10 }];
+                XLSX.utils.book_append_sheet(wb, ws1, `${this.statsYear}年統計`);
+                
+                // 工作表2：詳細案場統計（員工×月份×案場）
+                const wsData2 = [
+                    [`${this.statsYear}年度詳細案場統計`],
+                    [],
+                    ['員工姓名', '月份', '案場地點', '天數']
+                ];
+                
+                data.forEach(emp => {
+                    for (let month = 1; month <= 12; month++) {
+                        const monthStr = `${this.statsYear}-${String(month).padStart(2, '0')}`;
+                        const monthStart = `${monthStr}-01`;
+                        const monthEnd = new Date(this.statsYear, month, 0).toISOString().split('T')[0];
+                        
+                        const attData = this.attendance[emp.id] || { dates: {}, locations: {} };
+                        const monthLocationMap = {};
+                        
+                        Object.keys(attData.dates || {}).forEach(date => {
+                            if (date >= monthStart && date <= monthEnd && attData.dates[date]) {
+                                const loc = attData.locations?.[date] || '未填寫';
+                                monthLocationMap[loc] = (monthLocationMap[loc] || 0) + 1;
+                            }
+                        });
+                        
+                        Object.entries(monthLocationMap).forEach(([location, days]) => {
+                            wsData2.push([emp.name, `${month}月`, location, days]);
+                        });
+                    }
+                });
+
+                const ws2 = XLSX.utils.aoa_to_sheet(wsData2);
+                ws2['!cols'] = [{ wch: 12 }, { wch: 8 }, { wch: 20 }, { wch: 8 }];
+                XLSX.utils.book_append_sheet(wb, ws2, '詳細案場統計');
+                
+                // 工作表3：全年案場統計（誰去哪個案場共幾次）
+                const wsData3 = [
+                    [`${this.statsYear}年度案場總計`],
+                    [],
+                    ['員工姓名', '案場地點', '全年天數']
+                ];
+                
+                data.forEach(emp => {
+                    emp.locationStats.forEach(loc => {
+                        wsData3.push([emp.name, loc.location, loc.days]);
+                    });
+                });
+
+                const ws3 = XLSX.utils.aoa_to_sheet(wsData3);
+                ws3['!cols'] = [{ wch: 12 }, { wch: 20 }, { wch: 10 }];
+                XLSX.utils.book_append_sheet(wb, ws3, '案場總計');
+                
+                // 工作表4：各月薪資結算
+                const wsData4 = [
+                    [`${this.statsYear}年度薪資結算`],
+                    []
+                ];
+                
+                for (let month = 1; month <= 12; month++) {
+                    const monthStart = new Date(this.statsYear, month - 1, 1).toISOString().split('T')[0];
+                    const monthEnd = new Date(this.statsYear, month, 0).toISOString().split('T')[0];
+                    
+                    // 暫時設定報表日期
+                    const originalStart = this.reportStart;
+                    const originalEnd = this.reportEnd;
+                    this.reportStart = monthStart;
+                    this.reportEnd = monthEnd;
+                    
+                    const monthData = this.calculateReport();
+                    
+                    // 恢復原始日期
+                    this.reportStart = originalStart;
+                    this.reportEnd = originalEnd;
+                    
+                    wsData4.push([]);
+                    wsData4.push([`${month}月份`]);
+                    wsData4.push(['員工姓名', '出勤天數', '基本薪資', '調整金額', '加班費', '借支', '實發薪資']);
+                    
+                    monthData.forEach(d => {
+                        wsData4.push([
+                            d.name,
+                            d.days,
+                            d.baseSalary,
+                            d.adj,
+                            d.totalOvertimePay,
+                            d.totalLoan,
+                            d.finalSalary
+                        ]);
+                    });
+                }
+
+                const ws4 = XLSX.utils.aoa_to_sheet(wsData4);
+                ws4['!cols'] = [{ wch: 12 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 12 }];
+                XLSX.utils.book_append_sheet(wb, ws4, '薪資結算');
+                
+                XLSX.writeFile(wb, `年度完整統計_${this.statsYear}.xlsx`);
+            }
+
+            downloadTemplate() {
+                const wsData = [
+                    ['員工姓名', '日薪'],
+                    ['王小明', 1500],
+                    ['李小華', 1800],
+                    ['張大衛', 2000]
+                ];
+                
+                const wb = XLSX.utils.book_new();
+                const ws = XLSX.utils.aoa_to_sheet(wsData);
+                ws['!cols'] = [{ wch: 12 }, { wch: 10 }];
+                
+                XLSX.utils.book_append_sheet(wb, ws, '員工名單');
+                XLSX.writeFile(wb, '員工匯入範例.xlsx');
+            }
+
+            exportEmployees() {
+                const wsData = [
+                    ['員工清單匯出'],
+                    [`匯出日期: ${new Date().toLocaleDateString('zh-TW')}`],
+                    [],
+                    ['員工姓名', '目前日薪', '狀態', '創建日期']
+                ];
+                
+                this.employees
+                    .sort((a, b) => a.name.localeCompare(b.name))
+                    .forEach(emp => {
+                        wsData.push([
+                            emp.name,
+                            emp.dailyRate,
+                            emp.status === 'active' ? '在職' : '離職',
+                            new Date(emp.createdAt || Date.now()).toLocaleDateString('zh-TW')
+                        ]);
+                    });
+                
+                const wb = XLSX.utils.book_new();
+                const ws = XLSX.utils.aoa_to_sheet(wsData);
+                ws['!cols'] = [{ wch: 15 }, { wch: 12 }, { wch: 8 }, { wch: 15 }];
+                
+                XLSX.utils.book_append_sheet(wb, ws, '員工清單');
+                XLSX.writeFile(wb, `員工清單_${new Date().toISOString().split('T')[0]}.xlsx`);
+            }
+
+            filterOvertimes() {
+                this.overtimeFilterStart = document.getElementById('overtimeFilterStart').value;
+                this.overtimeFilterEnd = document.getElementById('overtimeFilterEnd').value;
+                this.render();
+            }
+
+            async handleImport(e) {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    try {
+                        const data = new Uint8Array(event.target.result);
+                        const workbook = XLSX.read(data, { type: 'array' });
+                        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                        const rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
+                        
+                        const { collection, addDoc, doc, setDoc } = this.modules;
+                        let count = 0;
+                        
+                        for (let i = 1; i < rows.length; i++) {
+                            const [name, rate] = rows[i];
+                            if (name && rate) {
+                                const empRef = await addDoc(collection(this.db, `${this.userPath}/employees`), {
+                                    name: String(name).trim(),
+                                    dailyRate: Number(rate),
+                                    status: 'active',
+                                    createdAt: Date.now()
+                                });
+                                await setDoc(doc(this.db, `${this.userPath}/salaryHistory`, empRef.id), [{
+                                    date: new Date().toISOString().split('T')[0],
+                                    dailyRate: Number(rate),
+                                    note: '初始日薪（匯入）',
+                                    timestamp: Date.now()
+                                }]);
+                                count++;
+                            }
+                        }
+                        
+                        alert(`成功匯入 ${count} 位員工！`);
+                    } catch (err) {
+                        console.error(err);
+                        alert('匯入失敗，請確認檔案格式正確');
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+                e.target.value = '';
+            }
+
+            openLocationManagement() {
+                this.modals.locationManagement = true;
+                this.render();
+            }
+
+            async deleteLocation(locationId, locationName) {
+                if (!confirm(`確定要從快選列表中移除「${locationName}」嗎？\n\n注意：這不會刪除歷史記錄，只是從快選列表中移除此案場。`)) {
+                    return;
+                }
+                const { doc, deleteDoc } = this.modules;
+                await deleteDoc(doc(this.db, `${this.userPath}/locations`, locationId));
+                this.render();
+            }
+
+            viewSalaryHistory(empId, empName) {
+                this.currentSalaryHistory = { empId, empName };
+                this.modals.salaryHistory = true;
+                this.render();
+            }
+
+            renderLocationManagementModal() {
+                const sortedLocations = [...this.locations].sort((a, b) => b.count - a.count);
+
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50" 
+                         onclick="if(event.target === this) app.closeModal('locationManagement')">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-md shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center">案場管理</h3>
+                            <p class="text-xs text-gray-400 text-center">
+                                管理常用案場列表（已完工的案場可以刪除）
+                            </p>
+                            
+                            <div class="space-y-2 max-h-96 overflow-y-auto">
+                                ${sortedLocations.length > 0 ? sortedLocations.map(loc => `
+                                    <div class="bg-gray-50 p-3 rounded-xl flex justify-between items-center">
+                                        <div>
+                                            <div class="font-bold text-sm">📍 ${loc.name}</div>
+                                            <div class="text-xs text-gray-400">使用 ${loc.count} 次</div>
+                                        </div>
+                                        <button 
+                                            onclick="app.deleteLocation('${loc.id}', '${loc.name.replace(/'/g, "\\'")}')" 
+                                            class="text-red-400 hover:text-red-600 transition-colors p-2"
+                                            title="從快選列表移除"
+                                        >
+                                            🗑️
+                                        </button>
+                                    </div>
+                                `).join('') : `
+                                    <div class="text-center text-gray-400 py-8">
+                                        <p>尚無案場記錄</p>
+                                        <p class="text-xs mt-2">打卡時輸入案場地點後會自動新增到這裡</p>
+                                    </div>
+                                `}
+                            </div>
+                            
+                            <button onclick="app.closeModal('locationManagement')" 
+                                    class="w-full py-3 font-bold text-gray-400">
+                                關閉
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderSalaryHistoryModal() {
+                const history = this.salaryHistory[this.currentSalaryHistory.empId];
+                let historyArray = [];
+                
+                if (Array.isArray(history)) {
+                    historyArray = history;
+                } else if (history && typeof history === 'object') {
+                    historyArray = Object.values(history);
+                }
+                
+                const sortedHistory = [...historyArray].sort((a, b) => 
+                    new Date(b.date) - new Date(a.date)
+                );
+
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50" 
+                         onclick="if(event.target === this) app.closeModal('salaryHistory')">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-md shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center">日薪歷史記錄</h3>
+                            <p class="text-sm text-gray-500 text-center">
+                                ${this.currentSalaryHistory.empName}
+                            </p>
+                            
+                            <div class="space-y-2 max-h-96 overflow-y-auto">
+                                ${sortedHistory.length > 0 ? sortedHistory.map((record, index) => `
+                                    <div class="bg-gray-50 p-4 rounded-xl ${index === 0 ? 'border-2 border-blue-500' : ''}">
+                                        <div class="flex justify-between items-start mb-2">
+                                            <div>
+                                                <div class="font-bold text-lg text-blue-600">
+                                                    $${record.dailyRate}
+                                                </div>
+                                                <div class="text-xs text-gray-400">${record.date}</div>
+                                            </div>
+                                            ${index === 0 ? '<span class="text-xs bg-blue-500 text-white px-2 py-1 rounded-full">目前</span>' : ''}
+                                        </div>
+                                        ${record.note ? `
+                                            <div class="text-xs text-gray-600 mt-2">📝 ${record.note}</div>
+                                        ` : ''}
+                                    </div>
+                                `).join('') : `
+                                    <div class="text-center text-gray-400 py-8">
+                                        <p>尚無日薪記錄</p>
+                                    </div>
+                                `}
+                            </div>
+                            
+                            <div class="bg-blue-50 p-3 rounded-xl text-xs text-blue-600">
+                                💡 報表會根據打卡日期自動使用當時的日薪計算，調薪不會影響歷史報表
+                            </div>
+                            
+                            <button onclick="app.closeModal('salaryHistory')" 
+                                    class="w-full py-3 font-bold text-gray-400">
+                                關閉
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        let app;
+        window.addEventListener('DOMContentLoaded', () => {
+            setTimeout(() => { 
+                if (window.firebaseDB && window.firebaseAuth) {
+                    app = new App(); 
+                }
+            }, 800);
+        });
+    </script>
+</body>
+</html>
